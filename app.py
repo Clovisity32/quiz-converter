@@ -1,96 +1,79 @@
 import streamlit as st
+from streamlit_drawable_canvas import st_canvas
 import fitz
 import easyocr
 import torch
 import numpy as np
-import os
-import re
-import shutil
-from PIL import Image, ImageDraw
+from PIL import Image
 
-st.set_page_config(page_title="AI Quiz Tool", layout="wide")
+st.set_page_config(layout="wide")
+st.title("Editable Quiz Cropper")
 
-# --- UI HEADER ---
-st.title("✂️ Interactive PDF Quiz Cropper")
-st.markdown("Upload your files, adjust the detection boxes, and download your package.")
+# 1. Setup OCR
+@st.cache_resource
+def load_ocr():
+    return easyocr.Reader(['en'], gpu=torch.cuda.is_available())
 
-# --- SIDEBAR CONTROLS ---
-with st.sidebar:
-    st.header("1. Upload")
-    pdf_file = st.file_uploader("Exam PDF", type="pdf")
-    ans_file = st.file_uploader("Answer Key (txt)", type="txt")
+reader = load_ocr()
+
+# 2. File Upload
+pdf_file = st.sidebar.file_uploader("Upload PDF", type="pdf")
+
+if pdf_file:
+    with open("temp.pdf", "wb") as f:
+        f.write(pdf_file.getbuffer())
     
-    st.header("2. Fine-Tune Detection")
-    margin_limit = st.slider("Left Margin (x-axis limit)", 20, 150, 80)
-    v_padding = st.slider("Vertical Padding (Crop height)", -20, 20, -10)
-    
-    st.header("3. Quality")
-    dpi_val = st.select_slider("Image Quality (DPI)", options=[150, 200, 300], value=200)
-
-# --- APP LOGIC ---
-if pdf_file and ans_file:
-    # Save files locally for processing
-    with open("temp.pdf", "wb") as f: f.write(pdf_file.read())
-    
-    # Load Answers
-    answers_map = {}
-    ans_content = ans_file.read().decode("utf-8")
-    for line in ans_content.splitlines():
-        match = re.search(r'(\d+)[\s,.]*([A-D])', line.upper())
-        if match: answers_map[int(match.group(1))] = match.group(2)
-
     doc = fitz.open("temp.pdf")
+    page_num = st.sidebar.number_input("Page", min_value=1, max_value=len(doc)) - 1
+    page = doc[page_num]
     
-    @st.cache_resource
-    def load_ocr():
-        return easyocr.Reader(['en'], gpu=torch.cuda.is_available())
-    
-    reader = load_ocr()
-
-    # --- PREVIEW SECTION ---
-    page_idx = st.number_input("Preview Page #", min_value=1, max_value=len(doc)) - 1
-    page = doc[page_idx]
-    
-    # Get OCR Preview
-    pix = page.get_pixmap(dpi=100) # Low DPI for fast preview
+    # Render page to image
+    pix = page.get_pixmap(dpi=150)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    draw = ImageDraw.Draw(img)
+
+    # 3. Initial AI Detection (Pre-filling the canvas)
+    if "initial_rects" not in st.session_state:
+        img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+        results = reader.readtext(img_np)
+        
+        initial_objects = []
+        for (bbox, text, prob) in results:
+            clean = "".join(filter(str.isdigit, text))
+            if clean and bbox[0][0] < 100: # Threshold for left margin
+                # Format for streamlit-canvas
+                obj = {
+                    "type": "rect",
+                    "left": bbox[0][0],
+                    "top": bbox[0][1],
+                    "width": bbox[2][0] - bbox[0][0],
+                    "height": bbox[2][1] - bbox[0][1],
+                    "fill": "rgba(255, 0, 0, 0.3)",
+                    "stroke": "red"
+                }
+                initial_objects.append(obj)
+        st.session_state.initial_rects = {"objects": initial_objects}
+
+    # 4. The Interactive Canvas
+    st.subheader("Edit Boxes: Click to select, drag to move/resize, or press 'Del' to remove.")
     
-    # Run OCR on current page
-    img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
-    results = reader.readtext(img_np)
-    
-    detected_y = []
-    for (bbox, text, prob) in results:
-        x0 = bbox[0][0] * (page.rect.width / pix.width)
-        y0 = bbox[0][1] * (page.rect.height / pix.height)
-        clean = "".join(filter(str.isdigit, text))
-        
-        if clean and x0 < margin_limit:
-            # Draw visual feedback
-            draw.rectangle([bbox[0][0], bbox[0][1], bbox[2][0], bbox[2][1]], outline="red", width=3)
-            detected_y.append(y0)
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 165, 0, 0.3)",  # Box color
+        stroke_width=2,
+        stroke_color="red",
+        background_image=img,
+        initial_drawing=st.session_state.initial_rects,
+        update_streamlit=True,
+        height=pix.height,
+        width=pix.width,
+        drawing_mode="transform", # This allows moving and resizing
+        key="canvas",
+    )
 
-    st.image(img, caption="Red boxes show detected Question Numbers. If questions are missing, increase 'Left Margin' in sidebar.", use_container_width=True)
-
-    # --- PROCESSING & DOWNLOAD ---
-    if st.button("🚀 Process Full PDF & Download Zip"):
-        output_folder = "quiz_package"
-        if os.path.exists(output_folder): shutil.rmtree(output_folder)
-        os.makedirs(output_folder)
-        
-        q_num = 1
-        markdown_content = ""
-        
-        progress_bar = st.progress(0)
-        
-        for p_idx in range(len(doc)):
-            p = doc[p_idx]
-            # ... (Your existing cropping logic goes here, using the margin_limit variable) ...
-            # [Logic simplified for brevity, use your original loop with variables]
-            progress_bar.progress((p_idx + 1) / len(doc))
-
-        shutil.make_archive("results", 'zip', output_folder)
-        with open("results.zip", "rb") as f:
-            st.download_button("📥 Download Quiz Package", f, file_name="quiz_results.zip")
-          
+    # 5. Export Logic
+    if canvas_result.json_data is not None:
+        objects = canvas_result.json_data["objects"]
+        if st.button(f"Crop and Save {len(objects)} Questions"):
+            for idx, obj in enumerate(objects):
+                # Convert canvas coordinates back to PDF scale
+                # Save images based on these final hand-adjusted boxes
+                st.write(f"Cropping Question {idx+1} at Y: {obj['top']}")
