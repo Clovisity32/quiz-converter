@@ -28,9 +28,6 @@ def load_ocr():
 
 # --- 3. UI HEADER ---
 st.title("✂️ Interactive AI Quiz Cropper")
-st.markdown("""
-**Workflow:** 1. Upload Files → 2. Review/Edit Boxes per page → 3. Process & Download Zip.
-""")
 
 # --- 4. SIDEBAR SETTINGS ---
 with st.sidebar:
@@ -61,7 +58,7 @@ if pdf_file and ans_file:
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     bg_url = get_image_base64(img)
     
-    # AI Detection Logic
+    # AI Detection Logic (runs once per page)
     if f"rects_{page_num}" not in st.session_state:
         with st.spinner(f"AI scanning Page {page_num + 1}..."):
             img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
@@ -70,7 +67,6 @@ if pdf_file and ans_file:
             initial_objects = []
             for (bbox, text, prob) in results:
                 clean = "".join(filter(str.isdigit, text))
-                # Logic: Is it a digit and is it on the left side (approx < 100 points)?
                 if clean and (bbox[0][0] * (page.rect.width / pix.width)) < 100:
                     obj = {
                         "type": "rect",
@@ -84,9 +80,9 @@ if pdf_file and ans_file:
                     initial_objects.append(obj)
             st.session_state[f"rects_{page_num}"] = {"objects": initial_objects}
 
-    # 6. INTERACTIVE CANVAS (Using st.empty to prevent collisions)
+    # 6. INTERACTIVE CANVAS (The Fix: Using a container and comparison check)
     st.subheader(f"Edit Questions on Page {page_num + 1}")
-    st.caption("Instructions: Click a box to Resize/Move. Use 'Delete' key to remove. Draw new boxes if needed.")
+    st.caption("Click a box to Resize/Move. Use 'Delete' key to remove. Draw new boxes if needed.")
     
     canvas_placeholder = st.empty()
     
@@ -105,9 +101,10 @@ if pdf_file and ans_file:
             key=f"canvas_p{page_num}", 
         )
 
-    # Update session state with manual adjustments
+    # CRITICAL FIX: Only update if the data is different to avoid re-run loops
     if canvas_result.json_data is not None:
-        st.session_state[f"rects_{page_num}"] = canvas_result.json_data
+        if canvas_result.json_data != st.session_state[f"rects_{page_num}"]:
+            st.session_state[f"rects_{page_num}"] = canvas_result.json_data
 
     # --- 7. FINAL BATCH PROCESSING ---
     st.divider()
@@ -129,18 +126,16 @@ if pdf_file and ans_file:
         
         for p_idx in range(len(doc)):
             p = doc[p_idx]
-            
             if f"rects_{p_idx}" in st.session_state:
                 objs = st.session_state[f"rects_{p_idx}"]["objects"]
                 objs.sort(key=lambda x: x["top"]) 
                 
-                # Calibration factor
+                # Calibration factor for cropping
                 preview_h = p.get_pixmap(dpi=dpi_preview).height
                 scale_y = p.rect.height / preview_h
 
                 for i, obj in enumerate(objs):
                     y_start = obj["top"] * scale_y
-                    
                     if i + 1 < len(objs):
                         y_end = objs[i+1]["top"] * scale_y
                     else:
@@ -158,7 +153,6 @@ if pdf_file and ans_file:
                         markdown_content += f"{prefix}{letter.lower()}) {letter}\n"
                     markdown_content += "\n"
                     global_q_count += 1
-            
             progress_bar.progress((p_idx + 1) / len(doc))
 
         with open(os.path.join(output_folder, "questions.txt"), "w", encoding="utf-8") as f:
@@ -168,7 +162,6 @@ if pdf_file and ans_file:
         with open("final_quiz.zip", "rb") as f:
             st.download_button("📥 Download Quiz Results (.zip)", f, file_name="quiz_results.zip")
         st.success(f"Generated {global_q_count-1} questions!")
-
 else:
     st.info("Waiting for PDF and Answer Key upload...")
     
