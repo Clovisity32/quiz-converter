@@ -11,62 +11,71 @@ import base64
 from PIL import Image
 from io import BytesIO
 
-# --- PAGE CONFIG ---
+# --- 1. PAGE SETUP ---
 st.set_page_config(page_title="AI Quiz Cropper", layout="wide")
 
-# --- HELPER FUNCTIONS ---
+# --- 2. HELPER FUNCTIONS ---
 def get_image_base64(img):
-    """Encodes PIL image to base64 to avoid Streamlit URL errors."""
+    """Converts PIL image to base64 to prevent background_image_url errors."""
     buffered = BytesIO()
     img.save(buffered, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffered.getvalue()).decode()
 
 @st.cache_resource
 def load_ocr():
-    """Loads OCR model once and keeps it in memory."""
+    """Initializes EasyOCR and caches it for performance."""
     return easyocr.Reader(['en'], gpu=torch.cuda.is_available())
 
-# --- APP UI ---
-st.title("✂️ Interactive Quiz Cropper")
-st.markdown("1. Upload Files → 2. Edit Boxes (Move/Resize/Delete) → 3. Download Zip")
+# --- 3. UI HEADER ---
+st.title("✂️ Interactive AI Quiz Cropper")
+st.markdown("""
+**Workflow:** 1. Upload Files 
+2. Use 'Current Page' to review each page 
+3. Click/Drag boxes to fix AI mistakes (or draw new ones) 
+4. Click 'Process' at the bottom to get your ZIP.
+""")
 
+# --- 4. SIDEBAR SETTINGS ---
 with st.sidebar:
-    st.header("1. Upload")
+    st.header("📂 1. Upload Files")
     pdf_file = st.file_uploader("Exam PDF", type="pdf")
-    ans_file = st.file_uploader("Answer Key (txt)", type="txt")
+    ans_file = st.file_uploader("Answers TXT", type="txt")
     
-    st.header("2. Settings")
-    dpi_preview = st.slider("Preview Quality", 72, 150, 100)
-    dpi_final = st.select_slider("Final Crop Quality", options=[200, 300, 400], value=300)
+    st.header("⚙️ 2. Configuration")
+    dpi_preview = st.slider("Preview Clarity", 70, 150, 100)
+    dpi_final = st.select_slider("Export Resolution", options=[200, 300, 400], value=300)
+    st.info("Higher Export Resolution produces better images but takes longer.")
 
-# --- MAIN LOGIC ---
+# --- 5. MAIN LOGIC ---
 if pdf_file and ans_file:
-    # Save PDF locally
+    # Temporary storage for PDF
     with open("temp.pdf", "wb") as f:
         f.write(pdf_file.getbuffer())
     
     doc = fitz.open("temp.pdf")
     reader = load_ocr()
 
-    # Page Selection
+    # Page Navigation
     page_num = st.sidebar.number_input("Current Page", min_value=1, max_value=len(doc), step=1) - 1
     page = doc[page_num]
     
-    # 1. Render Page for Display
+    # Render PDF page to PIL Image
     pix = page.get_pixmap(dpi=dpi_preview)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    bg_url = get_image_base64(img)
     
-    # 2. AI Detection (only runs once per page)
+    # AI Detection Logic (Only runs if we haven't scanned this page yet)
     if f"rects_{page_num}" not in st.session_state:
-        with st.spinner("AI is finding question numbers..."):
+        with st.spinner(f"AI scanning Page {page_num + 1}..."):
             img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
             results = reader.readtext(img_np)
             
             initial_objects = []
             for (bbox, text, prob) in results:
+                # Basic cleaning of detected text
                 clean = "".join(filter(str.isdigit, text))
-                # Logic: Is it a number in the left margin?
-                if clean and (bbox[0][0] * (page.rect.width / pix.width)) < 80:
+                # Heuristic: Is it a digit and is it on the left side of the page?
+                if clean and (bbox[0][0] * (page.rect.width / pix.width)) < 100:
                     obj = {
                         "type": "rect",
                         "left": bbox[0][0],
@@ -79,9 +88,9 @@ if pdf_file and ans_file:
                     initial_objects.append(obj)
             st.session_state[f"rects_{page_num}"] = {"objects": initial_objects}
 
-    # 3. Interactive Canvas
-    st.info("💡 Instructions: Click a box to Move/Resize. Press 'Delete' to remove. Draw new boxes if AI missed any.")
-    bg_url = get_image_base64(img)
+    # 6. INTERACTIVE CANVAS
+    st.subheader(f"Edit Questions on Page {page_num + 1}")
+    st.caption("Click a box to transform/resize. Press 'Delete' to remove. Draw a rectangle for missing questions.")
     
     canvas_result = st_canvas(
         fill_color="rgba(255, 165, 0, 0.3)",
@@ -93,65 +102,85 @@ if pdf_file and ans_file:
         height=pix.height,
         width=pix.width,
         drawing_mode="transform",
-        key=f"canvas_{page_num}",
+        point_display_radius=0,
+        key=f"canvas_p{page_num}",
     )
 
-    # 4. Final Processing
-    if st.button("🚀 Process & Generate Zip"):
+    # Update session state with manual adjustments immediately
+    if canvas_result.json_data is not None:
+        st.session_state[f"rects_{page_num}"] = canvas_result.json_data
+
+    # --- 7. FINAL BATCH PROCESSING ---
+    st.divider()
+    if st.button("🚀 Finalize and Generate Package"):
         output_folder = "quiz_package"
         if os.path.exists(output_folder): shutil.rmtree(output_folder)
         os.makedirs(output_folder)
 
-        # Load answers into map
+        # Parse Answer Key
         answers_map = {}
         ans_content = ans_file.read().decode("utf-8")
         for line in ans_content.splitlines():
             match = re.search(r'(\d+)[\s,.]*([A-D])', line.upper())
             if match: answers_map[int(match.group(1))] = match.group(2)
 
-        # We use the boxes from the current canvas for the final crop
-        if canvas_result.json_data:
-            objects = canvas_result.json_data["objects"]
-            # Sort boxes by top-to-bottom
-            objects.sort(key=lambda x: x["top"])
+        markdown_content = f"Quiz Title: {pdf_file.name}\n\n"
+        global_q_count = 1
+        
+        progress_bar = st.progress(0)
+        
+        # Loop through all pages to apply user-edited boxes
+        for p_idx in range(len(doc)):
+            p = doc[p_idx]
             
-            markdown_content = f"Quiz: {pdf_file.name}\n\n"
+            # Check if this page was edited/scanned
+            if f"rects_{p_idx}" in st.session_state:
+                objs = st.session_state[f"rects_{p_idx}"]["objects"]
+                objs.sort(key=lambda x: x["top"]) # Sort by Y coordinate
+                
+                # We need scaling factors to go from Preview Pixels back to PDF Points
+                # We use the preview DPI used when the boxes were created (dpi_preview)
+                # But PyMuPDF allows us to use points (72 DPI) directly.
+                scale_y = p.rect.height / (p.get_pixmap(dpi=dpi_preview).height)
+
+                for i, obj in enumerate(objs):
+                    y_start = obj["top"] * scale_y
+                    
+                    # Logic: Crop until next box or end of page
+                    if i + 1 < len(objs):
+                        y_end = objs[i+1]["top"] * scale_y
+                    else:
+                        y_end = p.rect.height * 0.98
+
+                    crop_rect = fitz.Rect(0, y_start - 5, p.rect.width, y_end - 5)
+                    
+                    # High-res export
+                    pix_final = p.get_pixmap(clip=crop_rect, dpi=dpi_final)
+                    img_filename = f"q_{global_q_count}.png"
+                    pix_final.save(os.path.join(output_folder, img_filename))
+                    
+                    # Generate Markdown text
+                    correct = answers_map.get(global_q_count, "A")
+                    markdown_content += f"{global_q_count}. ![]({img_filename})\n"
+                    for letter in ['A', 'B', 'C', 'D']:
+                        prefix = "*" if letter == correct else ""
+                        markdown_content += f"{prefix}{letter.lower()}) {letter}\n"
+                    markdown_content += "\n"
+                    
+                    global_q_count += 1
             
-            for i, obj in enumerate(objects):
-                # Scale coordinates back to PDF points
-                scale_x = page.rect.width / pix.width
-                scale_y = page.rect.height / pix.height
-                
-                # Logic: Crop from this box's Y until the next box's Y (or end of page)
-                y_start = obj["top"] * scale_y
-                if i + 1 < len(objects):
-                    y_end = objects[i+1]["top"] * scale_y
-                else:
-                    y_end = page.rect.height * 0.98
+            progress_bar.progress((p_idx + 1) / len(doc))
 
-                crop_rect = fitz.Rect(0, y_start - 5, page.rect.width, y_end - 5)
-                
-                # High-res crop
-                pix_high = page.get_pixmap(clip=crop_rect, dpi=dpi_final)
-                img_name = f"q_{i+1}.png"
-                pix_high.save(os.path.join(output_folder, img_name))
-                
-                correct = answers_map.get(i+1, "A")
-                markdown_content += f"{i+1}. ![]({img_name})\n"
-                for letter in ['A', 'B', 'C', 'D']:
-                    prefix = "*" if letter == correct else ""
-                    markdown_content += f"{prefix}{letter.lower()}) {letter}\n"
-                markdown_content += "\n"
-
-            with open(os.path.join(output_folder, "questions.txt"), "w") as f:
-                f.write(markdown_content)
-
-            # Zip and Download
-            shutil.make_archive("quiz_results", 'zip', output_folder)
-            with open("quiz_results.zip", "rb") as f:
-                st.download_button("📥 Download Results (.zip)", f, file_name="quiz_results.zip")
-            st.success("✅ Package ready!")
+        # Save Markdown and Zip
+        with open(os.path.join(output_folder, "questions.txt"), "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+        
+        shutil.make_archive("final_quiz", 'zip', output_folder)
+        
+        with open("final_quiz.zip", "rb") as f:
+            st.download_button("📥 Download Quiz Results (.zip)", f, file_name="quiz_results.zip")
+        st.success(f"Generated {global_q_count-1} question images successfully!")
 
 else:
-    st.warning("Please upload both a PDF and an Answers.txt file to begin.")
+    st.info("Waiting for PDF and Answer Key upload...")
     
