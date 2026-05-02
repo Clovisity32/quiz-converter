@@ -25,7 +25,7 @@ def load_ocr():
     return easyocr.Reader(['en'], gpu=torch.cuda.is_available())
 
 # --- 3. UI HEADER ---
-st.title("✂️ AI Quiz Cropper (Stable Version)")
+st.title("✂️ AI Quiz Cropper (Stable Mode)")
 
 # --- 4. SIDEBAR ---
 with st.sidebar:
@@ -34,15 +34,18 @@ with st.sidebar:
     ans_file = st.file_uploader("Answers TXT", type="txt")
     
     st.header("⚙️ 2. Settings")
-    dpi_preview = st.slider("Preview Clarity", 70, 110, 85)
+    dpi_preview = st.slider("Preview Quality (Lower = Faster)", 60, 100, 80)
     dpi_final = st.select_slider("Export Resolution", options=[200, 300, 400], value=300)
 
 # --- 5. MAIN LOGIC ---
 if pdf_file and ans_file:
-    with open("temp.pdf", "wb") as f:
-        f.write(pdf_file.getbuffer())
+    # We save to a session-specific file to avoid permission errors
+    if "pdf_path" not in st.session_state:
+        with open("temp_exam.pdf", "wb") as f:
+            f.write(pdf_file.getbuffer())
+        st.session_state.pdf_path = "temp_exam.pdf"
     
-    doc = fitz.open("temp.pdf")
+    doc = fitz.open(st.session_state.pdf_path)
     reader = load_ocr()
 
     page_num = st.sidebar.number_input("Current Page", min_value=1, max_value=len(doc), step=1) - 1
@@ -53,10 +56,10 @@ if pdf_file and ans_file:
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     bg_url = get_image_base64(img)
     
-    # AI Detection with State Guard
+    # 6. OCR & STATE INITIALIZATION
     state_key = f"rects_{page_num}"
     if state_key not in st.session_state:
-        with st.spinner("AI scanning..."):
+        with st.spinner("AI analyzing layout..."):
             img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
             results = reader.readtext(img_np)
             initial_objects = []
@@ -70,11 +73,13 @@ if pdf_file and ans_file:
                     })
             st.session_state[state_key] = {"objects": initial_objects}
 
-    # --- 6. THE FIXED CANVAS (Using a Stable Key and Container) ---
+    # --- 7. THE STABLE CANVAS (The Fix) ---
     st.subheader(f"Editing Page {page_num + 1}")
     
-    # We use a placeholder to clear the canvas during page transitions
-    with st.container():
+    # Logic: We use a container that we can clear manually if needed
+    canvas_zone = st.container()
+    
+    with canvas_zone:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.3)",
             stroke_width=2,
@@ -86,22 +91,23 @@ if pdf_file and ans_file:
             width=pix.width,
             drawing_mode="transform",
             point_display_radius=0,
-            key=f"canvas_stable_p{page_num}", # Unique per page
+            # CRITICAL: Unique key and dynamic versioning to prevent React collision
+            key=f"v3_canvas_p{page_num}", 
         )
 
-    # Update State ONLY if the canvas has stable data and it's different
+    # Only sync state if the data exists and has changed
     if canvas_result.json_data is not None:
-        if canvas_result.json_data != st.session_state[state_key]:
+        if canvas_result.json_data["objects"] != st.session_state[state_key]["objects"]:
             st.session_state[state_key] = canvas_result.json_data
-            st.rerun() # Ensure the next page load is clean
+            # We don't use st.rerun() here to avoid the "Loop of Death"
 
-    # --- 7. FINAL BATCH PROCESSING ---
-    if st.button("🚀 Finalize & Download"):
+    # --- 8. FINAL BATCH PROCESSING ---
+    st.divider()
+    if st.button("🚀 Finalize & Generate ZIP"):
         output_folder = "quiz_package"
         if os.path.exists(output_folder): shutil.rmtree(output_folder)
         os.makedirs(output_folder)
 
-        # Parse Answer Key
         answers_map = {}
         ans_content = ans_file.read().decode("utf-8")
         for line in ans_content.splitlines():
@@ -131,13 +137,14 @@ if pdf_file and ans_file:
                     ans = answers_map.get(q_count, "A")
                     markdown_content += f"{q_count}. ![]({img_name})\n"
                     for L in ['A', 'B', 'C', 'D']:
-                        markdown_content += f"{'*' if L == ans else ''}{L.lower()}) {L}\n"
+                        prefix = "*" if L == ans else ""
+                        markdown_content += f"{prefix}{L.lower()}) {L}\n"
                     markdown_content += "\n"
                     q_count += 1
 
-        shutil.make_archive("quiz_results", 'zip', output_folder)
-        with open("quiz_results.zip", "rb") as f:
-            st.download_button("📥 Download Results", f, file_name="quiz_results.zip")
+        shutil.make_archive("results", 'zip', output_folder)
+        with open("results.zip", "rb") as f:
+            st.download_button("📥 Download ZIP", f, file_name="quiz_results.zip")
 else:
     st.info("Upload files to start.")
     
