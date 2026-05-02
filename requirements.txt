@@ -1,0 +1,6 @@
+streamlit
+pymupdf
+easyocr
+torch
+numpy
+Pillow
