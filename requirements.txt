@@ -1,4 +1,5 @@
 streamlit
+streamlit-canvas
 pymupdf
 easyocr
 torch
