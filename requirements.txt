@@ -3,7 +3,5 @@ streamlit-canvas
 pymupdf
 easyocr
 opencv-python-headless
---index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
